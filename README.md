@@ -48,6 +48,11 @@ database has no "squeeze worker" (see "Enable / disable table processing"
 section) running. Otherwise the DROP EXTENSION command will hang until it's
 cancelled.
 
+Note: when upgrading a database cluster with pg_squeeze installed (either using
+`pg_dumpall`/restore or `pg_upgrade`), make sure that the new cluster has
+`pg_squeeze` in `shared_preload_libraries` *before* you upgrade, otherwise
+the upgrade will fail.
+
 
 Register table for regular processing
 -------------------------------------
@@ -65,21 +70,45 @@ they were created.
 The simplest "registration" looks like
 
 	INSERT INTO squeeze.tables (tabschema, tabname, schedule)
-	VALUES ('public', 'foo', '{22:30, 03:00}');
+	VALUES ('public', 'foo', ('{30}', '{22}', NULL, NULL, '{3, 5}'));
 
 Additional columns can be specified optionally, for example:
 
 	INSERT INTO squeeze.tables
 	(tabschema, tabname, schedule, free_space_extra, vacuum_max_age,
 	max_retry)
-	VALUES ('public', 'bar', '{22:30, 03:00}', 30, '2 hours', 2);
+	VALUES ('public', 'bar', ('{30}', '{22}', NULL, NULL, '{3, 5}'), 30,
+	'2 hours', 2);
 
 Following is the complete description of table metadata.
 
 * "tabschema" and "tabname" are schema and table name respectively.
 
-* "schedule" column tells at which times of the day the table should be
-  checked. Such a check can possibly result in a new processing task.
+* "schedule" column tells when the table should be checked, and possibly
+  squeezed. The schedule is described by a value of the following composite
+  data type, which resembles a crontab [6] entry:
+
+	CREATE TYPE schedule AS (
+		minutes	minute[],
+		hours	hour[],
+		days_of_month dom[],
+		months month[],
+		days_of_week dow[]
+	);
+
+  Here, "minutes" (0 through 59) and "hours" (0 through 23) specify the time
+  of the check within a day, while "days_of_month" (1 through 31), "months" (1
+  through 12) and "days_of_week" (0 through 7, where both 0 and 7 stand for
+  Sunday) determine the day of the check.
+
+  The check is performed if "minute", "hour" and "month" all match the current
+  timestamp, while NULL value means any minute, hour and month
+  respectively. As for "days_of_month" and "days_of_week", at least one of
+  these needs to match the current timestamp, or both need to be NULL for the
+  check to take place.
+
+  For example, in the entries above tell that table "public"."bar" should be
+  checked every Wednesday and Friday at 22:30.
 
 * "free_space_extra" is the minimum percentage of "extra free space" needed to
   trigger processing of the table. The "extra" adjective refers to the fact
@@ -137,6 +166,19 @@ CAUTION! "squeeze.table" is the only table user should modify. If you want to
 change anything else, make sure you perfectly understand what you are doing.
 
 
+Ad-hoc processing for any table
+-------------------------------
+
+It's also possible to "squeeze" tables manually without registering, skipping any time and bloat
+checks.
+
+Function signature: `squeeze.squeeze_table(tabchema name, tabname name, clustering_index name, rel_tablespace name, ind_tablespaces name[])`
+
+Sample execution:
+
+    SELECT squeeze.squeeze_table('public', 'pgbench_accounts', null, null, null);
+
+
 Enable / disable table processing
 ---------------------------------
 
@@ -144,13 +186,17 @@ To enable automated processing, run this statement as superuser:
 
 	SELECT squeeze.start_worker();
 
-The function starts a background worker that periodically checks which of the
-registered tables are eligible for squeeze and creates and executes tasks for
-them. If the worker is already running for the current database, the function
-does return PID of a new worker, but that new worker will exit immediately.
+The function starts a background worker ("scheduler worker") that periodically
+checks which of the registered tables should be checked according to its
+schedule, and creates a new task for them. Another worker ("squeeze worker")
+is also launched that processes those tasks - note that the processing
+includes check whether the table is bloated enough.
 
-If the background worker is running, you can use the following statement to
-stop it:
+If the workers are already running for the current database, the function does
+not report any error but the new workers will exit immediately.
+
+If the background workers are running, you can use the following statement to
+stop them:
 
 	SELECT squeeze.stop_worker();
 
@@ -158,12 +204,8 @@ CAUTION! Only the functions mentioned in this section are considered user
 interface. If you want to call any other one, make sure you perfectly
 understand what you're doing.
 
-When there's no work to do, the worker sleeps before checking again. The delay
-is controlled by GUC parameter "squeeze.worker_naptime". It's measured in
-seconds and the default value is 1 minute.
-
-If you want the background worker to start automatically during startup of the
-whole PostgreSQL cluster, add entries like this to postgresql.conf file
+If you want the background workers to start automatically during startup of
+the whole PostgreSQL cluster, add entries like this to postgresql.conf file
 
 	squeeze.worker_autostart = 'my_database your_database'
 	squeeze.worker_role = postgres
@@ -179,6 +221,12 @@ will either reject to start or will stop without doing any work if
      2. squeeze.worker_role parameter specifies role which does not have the
      superuser privileges.
 
+Note: The functions/configuration variables explained above use singular form
+of the word "worker" although there are actually two workers. This is because
+only one worker existed in the previous versions of pg_squeeze, which ensured
+both scheduling and execution of the tasks. This implementation change is
+probably not worth to force all users to adjust their configuration files
+during upgrade.
 
 Control the impact on other backends
 ------------------------------------
@@ -221,8 +269,16 @@ although the background worker does unregister non-existing tables
 periodically.
 
 
-Upgrade from pg_squeeze 1.0.x or 1.1.x
---------------------------------------
+Upgrade from pg_squeeze 1.2.x
+-----------------------------
+
+CAUTION! As there's no straightforward way to migrate the scheduling
+information (see the notes on the "schedule" column of the "squeeze"."tables"
+table) automatically, and as the "schedule" column must not contain NULL
+values, the upgrade deletes the contents of the "squeeze"."tables"
+table. Please export the table contents to a file before you perform the
+upgrade and configure the checks of those tables again as soon as the upgrade
+is done.
 
 1. Set PG_CONFIG environment variable to point to pg_config command of your
    PostgreSQL installation.
@@ -235,7 +291,7 @@ Upgrade from pg_squeeze 1.0.x or 1.1.x
 
 5. Restart the PG instance
 
-6. Connect to each database containing pg_squeeze 1.0.x and run this command:
+6. Connect to each database containing pg_squeeze 1.2.x and run this command:
 
    ALTER EXTENSION pg_squeeze UPDATE;
 
@@ -260,14 +316,15 @@ References
 
 [1] https://reorg.github.io/pg_repack/
 
-[2] https://www.postgresql.org/docs/9.6/static/sql-cluster.html
+[2] https://www.postgresql.org/docs/13/static/sql-cluster.html
 
-[3] https://www.postgresql.org/docs/9.6/static/bgworker.html
+[3] https://www.postgresql.org/docs/13/static/bgworker.html
 
-[4] https://www.postgresql.org/docs/9.6/static/logicaldecoding.html
+[4] https://www.postgresql.org/docs/13/static/logicaldecoding.html
 
-[5] https://www.postgresql.org/docs/9.6/static/mvcc-caveats.html
+[5] https://www.postgresql.org/docs/13/static/mvcc-caveats.html
 
+[6] https://www.freebsd.org/cgi/man.cgi?query=crontab&sektion=5&apropos=0&manpath=FreeBSD+12.1-RELEASE+and+Ports
 
 Authors
 -------

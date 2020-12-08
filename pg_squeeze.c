@@ -9,8 +9,14 @@
  */
 #include "pg_squeeze.h"
 
+#if PG_VERSION_NUM >= 130000
+#include "access/heaptoast.h"
+#endif
 #include "access/multixact.h"
 #include "access/sysattr.h"
+#if PG_VERSION_NUM >= 130000
+#include "access/xlogutils.h"
+#endif
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
@@ -35,7 +41,9 @@
 #else
 #include "optimizer/planner.h"
 #endif
+#if PG_VERSION_NUM < 130000
 #include "replication/logicalfuncs.h"
+#endif
 #include "replication/snapbuild.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
@@ -44,6 +52,7 @@
 #include "storage/smgr.h"
 #include "storage/standbydefs.h"
 #include "tcop/tcopprot.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
@@ -100,7 +109,8 @@ static void cache_composite_type_info(CatalogState *cat_state, Oid typid);
 static void get_composite_type_info(TypeCatInfo *tinfo);
 static IndexCatInfo *get_index_info(Oid relid, int *relninds,
 									bool *found_invalid,
-									bool invalid_check_only);
+									bool invalid_check_only,
+									bool *found_pk);
 static void check_attribute_changes(CatalogState *cat_state);
 static void check_index_changes(CatalogState *state);
 static void check_composite_type_changes(CatalogState *cat_state);
@@ -112,13 +122,15 @@ static void resolve_index_tablepaces(TablespaceInfo *tbsp_info,
 									 ArrayType *ind_tbsp_a);
 static Snapshot build_historic_snapshot(SnapBuild *builder);
 static void perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
-								 Snapshot snap_hist, Relation rel_dst);
+								 Snapshot snap_hist, Relation rel_dst,
+								 LogicalDecodingContext *ctx);
 static Oid create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 								  Oid tablespace, Oid relowner);
 static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
 									Oid *indexes_src, int nindexes,
 									TablespaceInfo *tbsp_info,
-									CatalogState *cat_state);
+									CatalogState *cat_state,
+									LogicalDecodingContext *ctx);
 static ScanKey build_identity_key(Oid ident_idx_oid, Relation rel_src,
 								  int *nentries);
 static bool perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
@@ -131,8 +143,6 @@ static void swap_relation_files(Oid r1, Oid r2);
 static void swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2,
 							 Oid toastrelid2);
 static Oid get_toast_index(Oid toastrelid);
-
-int squeeze_worker_naptime;
 
 /*
  * The maximum time to hold AccessExclusiveLock during the final
@@ -162,8 +172,8 @@ _PG_init(void)
 {
 	DefineCustomStringVariable(
 		"squeeze.worker_autostart",
-		"OIDs of databases for which squeeze worker starts automatically.",
-		"Comma-separated list for which squeeze worker starts as soon as "
+		"OIDs of databases for which background workers start automatically.",
+		"Comma-separated list for of databases which squeeze worker starts as soon as "
 		"the cluster startup has completed.",
 		&squeeze_worker_autostart,
 		NULL,
@@ -173,24 +183,13 @@ _PG_init(void)
 
 	DefineCustomStringVariable(
 		"squeeze.worker_role",
-		"Role that background worker uses to connect to database.",
+		"Role that background workers use to connect to database.",
 		"If background worker was launched automatically on cluster startup, "
 		"it uses this role to initiate database connection(s).",
 		&squeeze_worker_role,
 		NULL,
 		PGC_POSTMASTER,
 		0,
-		NULL, NULL, NULL);
-
-	DefineCustomIntVariable(
-		"squeeze.worker_naptime",
-		"Sleep time (in seconds) of the squeeze worker.",
-		"If there are no tables eligible for squeezing, the background worker "
-		"sleeps this amount of seconds and then tries again.",
-		&squeeze_worker_naptime,
-		60, 1, INT_MAX,
-		PGC_SIGHUP,
-		GUC_UNIT_S,
 		NULL, NULL, NULL);
 
 	if (squeeze_worker_autostart)
@@ -255,8 +254,12 @@ _PG_init(void)
 			BackgroundWorker worker;
 
 			dbname = lfirst(lc);
-			con = allocate_worker_con_info(dbname, squeeze_worker_role);
 
+			con = allocate_worker_con_info(dbname, squeeze_worker_role, true);
+			squeeze_initialize_bgworker(&worker, con, NULL, 0);
+			RegisterBackgroundWorker(&worker);
+
+			con = allocate_worker_con_info(dbname, squeeze_worker_role, false);
 			squeeze_initialize_bgworker(&worker, con, NULL, 0);
 			RegisterBackgroundWorker(&worker);
 		}
@@ -345,7 +348,11 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	relschema = PG_GETARG_NAME(0);
 	relname = PG_GETARG_NAME(1);
 	relrv_src = makeRangeVar(NameStr(*relschema), NameStr(*relname), -1);
+#if PG_VERSION_NUM >= 120000
+	rel_src = table_openrv(relrv_src, AccessShareLock);
+#else
 	rel_src = heap_openrv(relrv_src, AccessShareLock);
+#endif
 
 	check_prerequisites(rel_src);
 
@@ -354,6 +361,11 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 */
 	ident_idx_src = RelationGetReplicaIndex(rel_src);
 	replident = rel_src->rd_rel->relreplident;
+
+	/* The table can have PK although the replica identity is FULL. */
+	if (ident_idx_src == InvalidOid && rel_src->rd_pkindex != InvalidOid)
+		ident_idx_src = rel_src->rd_pkindex;
+
 	relid_src = RelationGetRelid(rel_src);
 	rel_src_owner = RelationGetForm(rel_src)->relowner;
 	toastrelid_src = rel_src->rd_rel->reltoastrelid;
@@ -392,7 +404,11 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 * We can't keep the lock till the end of transaction anyway - that's why
 	 * check_catalog_changes() exists.
 	 */
+#if PG_VERSION_NUM >= 120000
+	table_close(rel_src, AccessShareLock);
+#else
 	heap_close(rel_src, AccessShareLock);
+#endif
 
 	/*
 	 * Check if we're ready to capture changes that possibly take place during
@@ -417,8 +433,14 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 				 (errmsg("Table \"%s\".\"%s\" has no identity index",
 						 NameStr(*relschema), NameStr(*relname)))));
 
-	/* Change processing w/o index is not a good idea. */
-	if (replident == REPLICA_IDENTITY_FULL)
+	/*
+	 * Change processing w/o PK index is not a good idea.
+	 *
+	 * Note that some users need the "full identity" although the table does
+	 * have PK. ("full identity" + UNIQUE constraint is also a valid setup,
+	 * but it's harder to check).
+	 */
+	if (replident == REPLICA_IDENTITY_FULL && !cat_state->have_pk_index)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNIQUE_VIOLATION),
 				 (errmsg("Replica identity \"full\" not supported"))));
@@ -501,13 +523,21 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 		rel_src_owner);
 
 	/* The source relation will be needed for the initial load. */
+#if PG_VERSION_NUM >= 120000
+	rel_src = table_open(relid_src, AccessShareLock);
+#else
 	rel_src = heap_open(relid_src, AccessShareLock);
+#endif
 
 	/*
 	 * The new relation should not be visible for other transactions until we
 	 * commit, but exclusive lock just makes sense.
 	 */
+#if PG_VERSION_NUM >= 120000
+	rel_dst = table_open(relid_dst, AccessExclusiveLock);
+#else
 	rel_dst = heap_open(relid_dst, AccessExclusiveLock);
+#endif
 
 	toastrelid_dst = rel_dst->rd_rel->reltoastrelid;
 
@@ -522,7 +552,7 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 * The historic snapshot is used to retrieve data w/o concurrent
 	 * changes.
 	 */
-	perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst);
+	perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst, ctx);
 
 	/*
 	 * We no longer need to preserve the rows processed during the initial
@@ -574,7 +604,8 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 */
 	PushActiveSnapshot(GetTransactionSnapshot());
 	indexes_dst = build_transient_indexes(rel_dst, rel_src, indexes_src,
-										  nindexes, tbsp_info, cat_state);
+										  nindexes, tbsp_info, cat_state,
+										  ctx);
 	PopActiveSnapshot();
 
 	/*
@@ -606,7 +637,11 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 * (As we haven't changed the catalog entry yet, there's no need to send
 	 * invalidation messages.)
 	 */
+#if PG_VERSION_NUM >= 120000
+	table_close(rel_src, AccessShareLock);
+#else
 	heap_close(rel_src, AccessShareLock);
+#endif
 
 	/*
 	 * Valid identity index should exist now, see the identity checks above.
@@ -673,7 +708,7 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 * requesting exclusive lock. We should recognize this scenario by
 	 * checking pg_index alone.
 	 */
-	ind_info = get_index_info(relid_src, NULL, &invalid_index, true);
+	ind_info = get_index_info(relid_src, NULL, &invalid_index, true, NULL);
 	if (invalid_index)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
@@ -701,7 +736,8 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 		}
 		else
 			elog(DEBUG1,
-				 "Exclusive lock on table %u had to be released.", relid_src);
+				 "pg_squeeze: exclusive lock on table %u had to be released.",
+				 relid_src);
 	}
 	if (!source_finalized)
 		ereport(ERROR,
@@ -723,7 +759,11 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	/* The destination table is no longer necessary, so close it. */
 	/* XXX (Should have been closed right after
 	 * process_concurrent_changes()?) */
+#if PG_VERSION_NUM >= 120000
+	table_close(rel_dst, AccessExclusiveLock);
+#else
 	heap_close(rel_dst, AccessExclusiveLock);
+#endif
 
 	/*
 	 * Exchange storage (including TOAST) and indexes between the source and
@@ -899,7 +939,13 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 #if PG_VERSION_NUM >= 120000
 									InvalidXLogRecPtr,
 #endif
+#if PG_VERSION_NUM >= 130000
+									XL_ROUTINE(.page_read = read_local_xlog_page,
+											   .segment_open = wal_segment_open,
+											   .segment_close = wal_segment_close),
+#else
 									logical_read_local_xlog_page,
+#endif
 									NULL, NULL, NULL);
 
 #if PG_VERSION_NUM >= 110000
@@ -946,7 +992,6 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	dstate->tsslot = MakeSingleTupleTableSlot(dstate->tupdesc_change);
 #endif
 
-	dstate->data_size = 0;
 	dstate->resowner = 	ResourceOwnerCreate(CurrentResourceOwner,
 											"logical decoding");
 
@@ -1000,7 +1045,8 @@ get_catalog_state(Oid relid)
 	 * not change from "true" to "false", but let's be cautious anyway.)
 	 */
 	result->indexes = get_index_info(relid, &result->relninds,
-									 &result->invalid_index, false);
+									 &result->invalid_index, false,
+									 &result->have_pk_index);
 
 	/* If any index is "invalid", no more catalog information is needed. */
 	if (result->invalid_index)
@@ -1031,7 +1077,12 @@ get_pg_class_info(Oid relid, TransactionId *xmin, Form_pg_class *form_p,
 	 * ScanPgRelation() would do most of the work below, but relcache.c does
 	 * not export it.
 	 */
+#if PG_VERSION_NUM >= 120000
+	rel = table_open(RelationRelationId, AccessShareLock);
+#else
 	rel = heap_open(RelationRelationId, AccessShareLock);
+#endif
+
 	ScanKeyInit(&key[0],
 #if PG_VERSION_NUM >= 120000
 				Anum_pg_class_oid,
@@ -1074,7 +1125,11 @@ get_pg_class_info(Oid relid, TransactionId *xmin, Form_pg_class *form_p,
 		*desc_p = CreateTupleDescCopy(RelationGetDescr(rel));
 
 	systable_endscan(scan);
+#if PG_VERSION_NUM >= 120000
+	table_close(rel, AccessShareLock);
+#else
 	heap_close(rel, AccessShareLock);
+#endif
 }
 
 /*
@@ -1096,7 +1151,11 @@ get_attribute_info(Oid relid, int relnatts, TransactionId **xmins_p,
 	TransactionId	*result;
 	int	n = 0;
 
+#if PG_VERSION_NUM >= 120000
+	rel = table_open(AttributeRelationId, AccessShareLock);
+#else
 	rel = heap_open(AttributeRelationId, AccessShareLock);
+#endif
 
 	ScanKeyInit(&key[0], Anum_pg_attribute_attrelid,
 				BTEqualStrategyNumber, F_OIDEQ,
@@ -1141,7 +1200,11 @@ get_attribute_info(Oid relid, int relnatts, TransactionId **xmins_p,
 	}
 	Assert(relnatts == n);
 	systable_endscan(scan);
+#if PG_VERSION_NUM >= 120000
+	table_close(rel, AccessShareLock);
+#else
 	heap_close(rel, AccessShareLock);
+#endif
 	*xmins_p = result;
 }
 
@@ -1215,7 +1278,12 @@ get_composite_type_info(TypeCatInfo *tinfo)
 	Assert(tinfo->oid != InvalidOid);
 
 	/* Find the pg_type tuple. */
+#if PG_VERSION_NUM >= 120000
+	rel = table_open(TypeRelationId, AccessShareLock);
+#else
 	rel = heap_open(TypeRelationId, AccessShareLock);
+#endif
+
 	ScanKeyInit(&key[0],
 #if PG_VERSION_NUM >= 120000
 				Anum_pg_type_oid,
@@ -1252,7 +1320,11 @@ get_composite_type_info(TypeCatInfo *tinfo)
 
 	pfree(form_class);
 	systable_endscan(scan);
+#if PG_VERSION_NUM >= 120000
+	table_close(rel, AccessShareLock);
+#else
 	heap_close(rel, AccessShareLock);
+#endif
 }
 
 /*
@@ -1275,7 +1347,7 @@ get_composite_type_info(TypeCatInfo *tinfo)
  */
 static IndexCatInfo *
 get_index_info(Oid relid, int *relninds, bool *found_invalid,
-			   bool invalid_check_only)
+			   bool invalid_check_only, bool *found_pk)
 {
 	Relation	rel, rel_idx;
 	ScanKeyData key[1];
@@ -1292,6 +1364,8 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	bool		mismatch;
 
 	*found_invalid = false;
+	if (found_pk)
+		*found_pk = false;
 
 	/*
 	 * Open both pg_class and pg_index catalogs at once, so that we have a
@@ -1300,8 +1374,13 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	 * not conflict with AccessShareLock on the parent table could trigger
 	 * false alarms later in check_catalog_changes().
 	 */
+#if PG_VERSION_NUM >= 120000
+	rel = table_open(RelationRelationId, AccessShareLock);
+	rel_idx = table_open(IndexRelationId, AccessShareLock);
+#else
 	rel = heap_open(RelationRelationId, AccessShareLock);
 	rel_idx = heap_open(IndexRelationId, AccessShareLock);
+#endif
 
 	ScanKeyInit(&key[0], Anum_pg_index_indrelid,
 				BTEqualStrategyNumber, F_OIDEQ,
@@ -1330,6 +1409,8 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 		res_entry = (IndexCatInfo *) &result[n++];
 		res_entry->oid = form->indexrelid;
 		res_entry->xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+		if (found_pk && form->indisprimary)
+			*found_pk = true;
 
 		/*
 		 * Unlike get_attribute_info(), we can't receive the expected number
@@ -1343,18 +1424,30 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 		}
 	}
 	systable_endscan(scan);
+#if PG_VERSION_NUM >= 120000
+	table_close(rel_idx, AccessShareLock);
+#else
 	heap_close(rel_idx, AccessShareLock);
+#endif
 
 	/* Return if invalid index was found or ... */
 	if (*found_invalid)
 	{
+#if PG_VERSION_NUM >= 120000
+		table_close(rel, AccessShareLock);
+#else
 		heap_close(rel, AccessShareLock);
+#endif
 		return result;
 	}
 	/* ... caller is not interested in anything else.  */
 	if (invalid_check_only)
 	{
+#if PG_VERSION_NUM >= 120000
+		table_close(rel, AccessShareLock);
+#else
 		heap_close(rel, AccessShareLock);
+#endif
 		return result;
 	}
 
@@ -1368,7 +1461,11 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 		*relninds = n;
 	if (n == 0)
 	{
+#if PG_VERSION_NUM >= 120000
+		table_close(rel, AccessShareLock);
+#else
 		heap_close(rel, AccessShareLock);
+#endif
 		return result;
 	}
 
@@ -1428,7 +1525,11 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 				 errmsg("Concurrent change of index detected")));
 
 	systable_endscan(scan);
+#if PG_VERSION_NUM >= 120000
+	table_close(rel, AccessShareLock);
+#else
 	heap_close(rel, AccessShareLock);
+#endif
 	pfree(oids_a);
 
 	return result;
@@ -1575,6 +1676,7 @@ check_index_changes(CatalogState *cat_state)
 	int	relninds_new;
 	bool	failed = false;
 	bool	invalid_index;
+	bool	have_pk_index;
 
 	if (cat_state->relninds == 0)
 	{
@@ -1583,7 +1685,7 @@ check_index_changes(CatalogState *cat_state)
 	}
 
 	inds_new = get_index_info(cat_state->rel.relid, &relninds_new,
-							  &invalid_index, false);
+							  &invalid_index, false, &have_pk_index);
 
 	/*
 	 * If this field was set to true, no attention was paid to the other
@@ -1593,6 +1695,13 @@ check_index_changes(CatalogState *cat_state)
 		failed = true;
 
 	if (!failed && relninds_new != cat_state->relninds)
+		failed = true;
+
+	/*
+	 * It might be o.k. for the PK index to disappear if the table still has
+	 * an unique constraint, but this is too hard to check.
+	 */
+	if (!failed && cat_state->have_pk_index != have_pk_index)
 		failed = true;
 
 	if (!failed)
@@ -1887,7 +1996,8 @@ build_historic_snapshot(SnapBuild *builder)
  */
 static void
 perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
-					 Snapshot snap_hist, Relation rel_dst)
+					 Snapshot snap_hist, Relation rel_dst,
+					 LogicalDecodingContext *ctx)
 {
 	bool	use_sort;
 	int	batch_size, batch_max_size;
@@ -1906,6 +2016,22 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	ResourceOwner	res_owner_old, res_owner_plan;
 	BulkInsertState bistate;
 	MemoryContext	load_cxt, old_cxt;
+	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
+	DecodingOutputState	*dstate;
+
+	/*
+	 * The session origin will be used to mark WAL records produced by the
+	 * load itself so that they are not decoded.
+	 */
+	Assert(replorigin_session_origin == InvalidRepOriginId);
+	replorigin_session_origin = replorigin_create("pg_squeeze");
+
+	/*
+	 * Also remember that the WAL records created during the load should not
+	 * be decoded later.
+	 */
+	dstate = (DecodingOutputState *) ctx->output_writer_private;
+	dstate->rorigin = replorigin_session_origin;
 
 	if (cluster_idx_rv != NULL)
 	{
@@ -1975,8 +2101,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 											false);
 
 	/*
-	 * If tuplesort is not applicable, we store as much data as we can into
-	 * memory. The more memory is available, the fewer iterations.
+	 * If tuplesort is not applicable, we store as much data as we can store
+	 * in memory. The more memory is available, the fewer iterations.
 	 */
 	if (!use_sort)
 	{
@@ -2005,6 +2131,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		HeapTuple	tup_in = NULL;
 		int	i;
 		Size	data_size = 0;
+		XLogRecPtr	end_of_wal;
 
 		/* Sorting cannot be split into batches. */
 		for (i = 0;; i++)
@@ -2244,6 +2371,24 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		 * Free possibly-leaked memory.
 		 */
 		MemoryContextReset(load_cxt);
+
+		/*
+		 * Decode the WAL produced by the load, as well as by other
+		 * transactions, so that the replication slot can advance and WAL does
+		 * not pile up. Of course we must not apply the changes until the
+		 * initial load has completed.
+		 *
+		 * Note that the insertions into the new table shouldn't actually be
+		 * decoded, they should be filtered out by their origin.
+		 */
+		end_of_wal = GetFlushRecPtr();
+		if (end_of_wal > end_of_wal_prev)
+		{
+			MemoryContextSwitchTo(old_cxt);
+			decode_concurrent_changes(ctx, end_of_wal, NULL);
+			MemoryContextSwitchTo(load_cxt);
+		}
+		end_of_wal_prev = end_of_wal;
 	}
 	/*
 	 * At whichever stage the loop broke, the historic snapshot should no
@@ -2272,6 +2417,10 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	ExecDropSingleTupleTableSlot(slot);
 #endif
 
+	/* Drop the replication origin. */
+	replorigin_drop(replorigin_session_origin, false);
+	replorigin_session_origin = InvalidRepOriginId;
+
 	/*
 	 * Unlock the index, but not the relation yet - caller will do so when
 	 * appropriate.
@@ -2281,6 +2430,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 
 	MemoryContextSwitchTo(old_cxt);
 	MemoryContextDelete(load_cxt);
+
+	elog(DEBUG1, "pg_squeeze: the initial load completed");
 }
 
 
@@ -2390,7 +2541,7 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 
 	ReleaseSysCache(tuple);
 
-	elog(DEBUG1, "Transient relation created: %u", result);
+	elog(DEBUG1, "pg_squeeze: transient relation created: %u", result);
 
 	/* Make sure the transient relation is visible.  */
 	CommandCounterIncrement();
@@ -2441,11 +2592,13 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 static Oid *
 build_transient_indexes(Relation rel_dst, Relation rel_src,
 						Oid *indexes_src, int nindexes,
-						TablespaceInfo *tbsp_info, CatalogState *cat_state)
+						TablespaceInfo *tbsp_info, CatalogState *cat_state,
+						LogicalDecodingContext *ctx)
 {
 	StringInfo	ind_name;
 	int	i;
 	Oid	*result;
+	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
 
 	Assert(nindexes > 0);
 
@@ -2478,6 +2631,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 #else
 		bool	isconstraint;
 #endif
+		XLogRecPtr	end_of_wal;
 
 		ind_oid = indexes_src[i];
 		ind = index_open(ind_oid, AccessShareLock);
@@ -2706,6 +2860,17 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		pfree(indoptions);
 		if (reloptions)
 			pfree(reloptions);
+
+		/*
+		 * Like in perform_initial_load(), process some WAL so that the
+		 * segment files can be recycled. Unlike the initial load, do not set
+		 * replorigin_session_origin because index changes are not decoded
+		 * anyway.
+		 */
+		end_of_wal = GetFlushRecPtr();
+		if (end_of_wal > end_of_wal_prev)
+			decode_concurrent_changes(ctx, end_of_wal, NULL);
+		end_of_wal_prev = end_of_wal;
 	}
 
 	return result;
@@ -2925,7 +3090,11 @@ swap_relation_files(Oid r1, Oid r2)
 	CatalogIndexState indstate;
 
 	/* We need writable copies of both pg_class tuples. */
+#if PG_VERSION_NUM >= 120000
+	relRelation = table_open(RelationRelationId, RowExclusiveLock);
+#else
 	relRelation = heap_open(RelationRelationId, RowExclusiveLock);
+#endif
 
 	reltup1 = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(r1));
 	if (!HeapTupleIsValid(reltup1))
@@ -3062,7 +3231,11 @@ swap_relation_files(Oid r1, Oid r2)
 	heap_freetuple(reltup1);
 	heap_freetuple(reltup2);
 
+#if PG_VERSION_NUM >= 120000
+	table_close(relRelation, RowExclusiveLock);
+#else
 	heap_close(relRelation, RowExclusiveLock);
+#endif
 
 	RelationCloseSmgrByOid(r1);
 	RelationCloseSmgrByOid(r2);
@@ -3162,14 +3335,22 @@ get_toast_index(Oid toastrelid)
 	List	*toastidxs;
 	Oid	result;
 
+#if PG_VERSION_NUM >= 120000
+	toastrel = table_open(toastrelid, NoLock);
+#else
 	toastrel = heap_open(toastrelid, NoLock);
+#endif
 	toastidxs = RelationGetIndexList(toastrel);
 
 	if (toastidxs == NIL || list_length(toastidxs) != 1)
 		elog(ERROR, "Unexpected number of TOAST indexes");
 
 	result = linitial_oid(toastidxs);
+#if PG_VERSION_NUM >= 120000
+	table_close(toastrel, NoLock);
+#else
 	heap_close(toastrel, NoLock);
+#endif
 
 	return result;
 }
@@ -3193,9 +3374,17 @@ get_heap_fillfactor(PG_FUNCTION_ARGS)
 	 * others to change the fillfactor (or even drop the relation) after this
 	 * function has returned.
 	 */
+#if PG_VERSION_NUM >= 120000
+	rel = table_open(relid, AccessShareLock);
+#else
 	rel = heap_open(relid, AccessShareLock);
+#endif
 	fillfactor = RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR);
+#if PG_VERSION_NUM >= 120000
+	table_close(rel, AccessShareLock);
+#else
 	heap_close(rel, AccessShareLock);
+#endif
 	PG_RETURN_INT32(fillfactor);
 }
 
@@ -3215,13 +3404,21 @@ get_heap_freespace(PG_FUNCTION_ARGS)
 	bool fsm_exists = true;
 
 	relid = PG_GETARG_OID(0);
+#if PG_VERSION_NUM >= 120000
+	rel = table_open(relid, AccessShareLock);
+#else
 	rel = heap_open(relid, AccessShareLock);
+#endif
 	nblocks = RelationGetNumberOfBlocks(rel);
 
 	/* NULL makes more sense than zero free space. */
 	if (nblocks == 0)
 	{
+#if PG_VERSION_NUM >= 120000
+		table_close(rel, AccessShareLock);
+#else
 		heap_close(rel, AccessShareLock);
+#endif
 		PG_RETURN_NULL();
 	}
 
@@ -3244,7 +3441,11 @@ get_heap_freespace(PG_FUNCTION_ARGS)
 			fsm_exists = false;
 		RelationCloseSmgr(rel);
 	}
+#if PG_VERSION_NUM >= 120000
+	table_close(rel, AccessShareLock);
+#else
 	heap_close(rel, AccessShareLock);
+#endif
 
 	if (!fsm_exists)
 		PG_RETURN_NULL();

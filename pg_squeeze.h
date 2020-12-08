@@ -17,13 +17,16 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/relscan.h"
+#if PG_VERSION_NUM < 130000
 #include "access/tuptoaster.h"
+#endif
 #include "access/xlog_internal.h"
 #include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "nodes/execnodes.h"
 #include "postmaster/bgworker.h"
 #include "replication/logical.h"
+#include "replication/origin.h"
 #include "utils/inval.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
@@ -83,12 +86,10 @@ typedef struct DecodingOutputState
 	TupleTableSlot	*tsslot;
 
 	/*
-	 * Total amount of space used by "change tuples". We use this field to
-	 * minimize the likelihood that tstore will have to be spilled to
-	 * disk. (Such a spilling should only be necessary for huge transactions,
-	 * because decoding of these cannot be split into multiple steps.)
+	 * WAL records having this origin have been created during the initial
+	 * load and should not be decoded.
 	 */
-	Size	data_size;
+	RepOriginId		rorigin;
 
 	ResourceOwner	resowner;
 } DecodingOutputState;
@@ -97,8 +98,6 @@ typedef struct DecodingOutputState
 extern	XLogSegNo	squeeze_current_segment;
 
 extern void	_PG_init(void);
-
-extern int squeeze_worker_naptime;
 
 /* Everything we need to call ExecInsertIndexTuples(). */
 typedef struct IndexInsertState
@@ -193,6 +192,9 @@ typedef struct CatalogState
 	 * indislive?
 	 */
 	bool	invalid_index;
+
+	/* Does the table have primary key index? */
+	bool	have_pk_index;
 } CatalogState;
 
 extern void check_catalog_changes(CatalogState *state, LOCKMODE lock_held);
@@ -208,6 +210,9 @@ extern bool process_concurrent_changes(LogicalDecodingContext *ctx,
 									   IndexInsertState *iistate,
 									   LOCKMODE lock_held,
 									   struct timeval *must_complete);
+extern bool decode_concurrent_changes(LogicalDecodingContext *ctx,
+									  XLogRecPtr end_of_wal,
+									  struct timeval *must_complete);
 extern void	_PG_output_plugin_init(OutputPluginCallbacks *cb);
 
 /*
@@ -224,6 +229,7 @@ typedef struct WorkerConInit
 {
 	char	*dbname;
 	char	*rolename;
+	bool	scheduler;
 } WorkerConInit;
 
 /*
@@ -237,12 +243,14 @@ typedef struct WorkerConInteractive
 {
 	Oid	dbid;
 	Oid	roleid;
+	bool	scheduler;
 } WorkerConInteractive;
 
 extern WorkerConInit *allocate_worker_con_info(char *dbname,
-											   char *rolename);
+											   char *rolename,
+											   bool scheduler);
 extern void squeeze_initialize_bgworker(BackgroundWorker *worker,
 										WorkerConInit *con_init,
 										WorkerConInteractive *con_interactive,
-										Oid notify_pid);
+										pid_t notify_pid);
 extern void squeeze_worker_main(Datum main_arg);
