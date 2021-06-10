@@ -922,7 +922,11 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	buf = makeStringInfo();
 	appendStringInfoString(buf, REPL_SLOT_BASE_NAME);
 	appendStringInfo(buf, "%u", MyDatabaseId);
+#if PG_VERSION_NUM >= 140000
+	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false);
+#else
 	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL);
+#endif
 
 	/*
 	 * Neither prepare_write nor do_write callback nor update_progress is
@@ -1957,8 +1961,13 @@ build_historic_snapshot(SnapBuild *builder)
 	/*
 	 * Likewise, fake MyPgXact->xmin so that the corresponding check passes.
 	 */
+#if PG_VERSION_NUM >= 140000
+	xmin_save = MyProc->xmin;
+	MyProc->xmin = InvalidTransactionId;
+#else
 	xmin_save = MyPgXact->xmin;
 	MyPgXact->xmin = InvalidTransactionId;
+#endif
 
 	/*
 	 * Call the core function to actually build the snapshot.
@@ -1970,7 +1979,11 @@ build_historic_snapshot(SnapBuild *builder)
 	 */
 	FirstSnapshotSet = FirstSnapshotSet_save;
 	XactIsoLevel = XactIsoLevel_save;
+#if PG_VERSION_NUM >= 140000
+	MyProc->xmin = xmin_save;
+#else
 	MyPgXact->xmin = xmin_save;
+#endif
 
 	/*
 	 * Fix the "satisfies" function that PG core incorrectly sets to
@@ -2024,14 +2037,22 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	 * load itself so that they are not decoded.
 	 */
 	Assert(replorigin_session_origin == InvalidRepOriginId);
+#if PG_VERSION_NUM >= 140000
+	replorigin_session_origin = DoNotReplicateId;
+#else
 	replorigin_session_origin = replorigin_create("pg_squeeze");
+#endif
 
 	/*
 	 * Also remember that the WAL records created during the load should not
 	 * be decoded later.
 	 */
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
+#if PG_VERSION_NUM >= 140000
+	dstate->rorigin = DoNotReplicateId;
+#else
 	dstate->rorigin = replorigin_session_origin;
+#endif
 
 	if (cluster_idx_rv != NULL)
 	{
@@ -2418,7 +2439,9 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 #endif
 
 	/* Drop the replication origin. */
+#if PG_VERSION_NUM < 140000
 	replorigin_drop(replorigin_session_origin, false);
+#endif
 	replorigin_session_origin = InvalidRepOriginId;
 
 	/*
