@@ -7,13 +7,13 @@ SELECT x, x
 FROM generate_series(1, 10) AS g(x);
 
 -- The trivial case.
-SELECT squeeze.squeeze_table('public', 'a', NULL, NULL, NULL);
+SELECT squeeze.squeeze_table('public', 'a', NULL);
 
 SELECT * FROM a;
 
 -- Clustering by index.
 CREATE INDEX a_i_idx_desc ON a(i DESC);
-SELECT squeeze.squeeze_table('public', 'a', 'a_i_idx_desc', NULL, NULL);
+SELECT squeeze.squeeze_table('public', 'a', 'a_i_idx_desc');
 SELECT * FROM a;
 
 -- Involve TOAST.
@@ -26,8 +26,9 @@ SELECT reltoastrelid > 0 FROM pg_class WHERE relname='b';
 CREATE TABLE b_copy (LIKE b INCLUDING ALL);
 INSERT INTO b_copy(i, t) SELECT i, t FROM b;
 -- Squeeze.
-SELECT squeeze.squeeze_table('public', 'b', NULL, NULL, NULL);
+SELECT squeeze.squeeze_table('public', 'b', NULL);
 -- Compare.
 SELECT b.t = b_copy.t
 FROM   b, b_copy
 WHERE  b.i = b_copy.i;
+

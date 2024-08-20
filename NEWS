@@ -1,3 +1,113 @@
+Release 1.7.0
+=============
+
+New features
+------------
+
+1. Make the code compatible with PostgreSQL server version 17.
+
+2. Do not copy the values of dropped columns into the new table storage
+   (file).
+
+   So far, only the whole rows (the deleted ones) were considered to
+   contribute to the table bloat. Now we also reclaim the space occupied by
+   dropped columns.
+
+3. Let the squeeze.squeeze_table function raise ERROR.
+
+   So far, the function only inserted record into the squeeze.log table if the
+   processing was successful, and into squeeze.errors if it failed. Now, in
+   the case of failure, the function also prints out the error message into
+   the console.
+
+4. Do not let the squeeze workers run if there is currently no work for them.
+
+   For automatic processing, one scheduler worker per database needs to run,
+   but the actual squeeze worker is only started if particular table appears
+   to be bloated. Once done with the processing, the squeeze worker exits
+   instead of waiting for another task.
+
+5. Improved parallelism of the squeeze workers.
+
+   Multiple worker processes (one per table) can be used since the release
+   1.6, but so far it was still possible that the work gets serialized due to
+   the logical decoding setup. Those limitations have been relaxed in 1.7.
+
+Bug fixes
+---------
+
+1. Fixed broken setup of "shared memory hooks".
+
+   This could cause server crash if other extensions installed their hooks as
+   well. (https://github.com/cybertec-postgresql/pg_squeeze/issues/68)
+
+2. Fixed evaluation of the squeeze.max_xlock_time configuration variable.
+
+   Due to this bug, pg_squeeze behaved as if the timeout was set to much lower
+   value. (The bug had no effect if the variable was set to 0, which is the
+   default.)
+
+3. Fixed permissions checks for the squeeze.pgstattuple_approx() function.q
+
+   Like with other functions of this extension, the SUPERUSER role attribute
+   is not needed for execution. The REPLICATION attribute is sufficient.
+
+4. Update BRIN indexes when appropriate.
+
+   If a row was updated during the table processing and only the attributes of
+   "summarizing" (BRIN) indexes changed, pg_squeeze might fail to update those
+   indexes.
+
+   This bug only affects pg_squeeze on PostgreSQL 16.
+
+
+Release 1.6.1
+=============
+
+Bug fixes
+---------
+
+1. Pass function argument as Datum rather than the "raw" timestamp.
+
+The bug can cause crash on platforms where timestamp is passed by reference
+(which usually means the 32-bit systems).
+
+
+Release 1.6.0
+=============
+
+New features
+------------
+
+1. Make the code compatible with PostgreSQL server version 16.
+
+2. Allow processing of multiple tables at a time, even if the are in the same
+   database.
+
+3. Enhanced monitoring - see the squeeze.get_active_workers() function as well
+   as the new columns of the squeeze.log table.
+
+Bug fixes
+---------
+
+1. Fixed the mechanism that checks the number of workers per database. This
+   also fixes the stop_worker() function so that it does not miss workers
+   anymore.
+
+Note
+----
+
+The behavior of the squeeze_table() function changes in this version, see
+README for more information.
+
+
+Release 1.5.0
+=============
+
+This release only updates the code so that it is compatible with PostgreSQL
+server version 15.
+
+
 Release 1.4.1
 =============
 

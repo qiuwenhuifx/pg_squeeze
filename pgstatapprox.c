@@ -3,9 +3,9 @@
  * pgstatapprox.c
  *		  Bloat estimation functions
  *
- * Copyright (c) 2014-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2023, PostgreSQL Global Development Group
  *
- * Copyright (c) 2016-2021, Cybertec Schönig & Schönig GmbH
+ * Copyright (c) 2016-2023, CYBERTEC PostgreSQL International GmbH
  *
  * IDENTIFICATION
  *		  contrib/pgstattuple/pgstatapprox.c
@@ -22,9 +22,9 @@
  */
 #include "postgres.h"
 
-#if PG_VERSION_NUM >= 120000
+#include "pg_squeeze.h"
+
 #include "access/heapam.h"
-#endif
 #include "access/visibilitymap.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -39,9 +39,6 @@
 #include "storage/procarray.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
-#if PG_VERSION_NUM < 120000
-#include "utils/tqual.h"
-#endif
 #include "commands/vacuum.h"
 
 PG_FUNCTION_INFO_V1(squeeze_pgstattuple_approx);
@@ -49,7 +46,7 @@ PG_FUNCTION_INFO_V1(squeeze_pgstattuple_approx);
 typedef struct output_type
 {
 	uint64		table_len;
-	uint64		scanned_percent;
+	double		scanned_percent;
 	uint64		tuple_count;
 	uint64		tuple_len;
 	double		tuple_percent;
@@ -99,8 +96,6 @@ statapprox_heap(Relation rel, output_type *stat)
 		OffsetNumber offnum,
 					maxoff;
 		Size		freespace;
-
-		CHECK_FOR_INTERRUPTS();
 
 		/*
 		 * If the page has only visible tuples, then we can find out the free
@@ -208,9 +203,6 @@ statapprox_heap(Relation rel, output_type *stat)
 	 * we already accounted for the space in those pages, too.
 	 */
 	stat->tuple_count = vac_estimate_reltuples(rel,
-#if PG_VERSION_NUM < 110000
-											   false, /* is_analyze */
-#endif
 											   nblocks,
 											   scanned,
 											   stat->tuple_count);
@@ -223,7 +215,7 @@ statapprox_heap(Relation rel, output_type *stat)
 	 */
 	if (nblocks != 0)
 	{
-		stat->scanned_percent = 100 * scanned / nblocks;
+		stat->scanned_percent = 100.0 * scanned / nblocks;
 		stat->tuple_percent = 100.0 * stat->tuple_len / stat->table_len;
 		stat->dead_tuple_percent = 100.0 * stat->dead_tuple_len / stat->table_len;
 		stat->free_percent = 100.0 * stat->free_space / stat->table_len;
@@ -251,10 +243,11 @@ squeeze_pgstattuple_approx(PG_FUNCTION_ARGS)
 	HeapTuple	ret;
 	int			i = 0;
 
-	if (!superuser())
+	if (!superuser() && !has_rolreplication(GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 (errmsg("must be superuser to use pgstattuple functions"))));
+				 (errmsg("must be superuser or replication role to run this function"))));
+
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
@@ -282,15 +275,20 @@ squeeze_pgstattuple_approx(PG_FUNCTION_ARGS)
 		  rel->rd_rel->relkind == RELKIND_MATVIEW ||
 		  rel->rd_rel->relkind == RELKIND_TOASTVALUE))
 		ereport(ERROR,
+#if PG_VERSION_NUM >= 150000
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("relation \"%s\" is of wrong relation kind",
+						RelationGetRelationName(rel)),
+				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
+#else
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("\"%s\" is not a table, materialized view, or TOAST table",
 						RelationGetRelationName(rel))));
+#endif
 
-#if PG_VERSION_NUM >= 120000
 	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("only heap AM is supported")));
-#endif
 
 	statapprox_heap(rel, &stat);
 

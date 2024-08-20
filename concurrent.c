@@ -4,7 +4,7 @@
  *	  Module to handle changes that took place while new table was being
  *	  created
  *
- * Copyright (c) 2016-2021, Cybertec Schönig & Schönig GmbH
+ * Copyright (c) 2016-2023, CYBERTEC PostgreSQL International GmbH
  *
  *-----------------------------------------------------------------------------------
  */
@@ -19,9 +19,14 @@
 #include "replication/decode.h"
 #include "utils/rel.h"
 
+#if PG_VERSION_NUM < 150000
+extern PGDLLIMPORT int wal_segment_size;
+#endif
+
 static void apply_concurrent_changes(DecodingOutputState *dstate,
 									 Relation relation, ScanKey key,
-									 int nkeys, IndexInsertState *iistate);
+									 int nkeys, IndexInsertState *iistate,
+									 struct timeval *must_complete);
 static bool processing_time_elapsed(struct timeval *utmost);
 
 static void plugin_startup(LogicalDecodingContext *ctx,
@@ -51,19 +56,29 @@ static bool plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id);
 bool
 process_concurrent_changes(LogicalDecodingContext *ctx,
 						   XLogRecPtr end_of_wal,
-						   CatalogState	*cat_state,
+						   CatalogState *cat_state,
 						   Relation rel_dst, ScanKey ident_key,
 						   int ident_key_nentries, IndexInsertState *iistate,
 						   LOCKMODE lock_held, struct timeval *must_complete)
 {
-	DecodingOutputState	*dstate;
-	bool	done;
+	DecodingOutputState *dstate;
+	bool		done;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
+
+	/*
+	 * If some changes could not be applied due to time constraint, make sure
+	 * the tuplestore is empty before we insert new tuples into it.
+	 */
+	if (dstate->nchanges > 0)
+		apply_concurrent_changes(dstate, rel_dst, ident_key,
+								 ident_key_nentries, iistate, NULL);
+	Assert(dstate->nchanges == 0);
+
 	done = false;
-	while(!done)
+	while (!done)
 	{
-		CHECK_FOR_INTERRUPTS();
+		exit_if_requested();
 
 		done = decode_concurrent_changes(ctx, end_of_wal, must_complete);
 
@@ -83,7 +98,11 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
 		 * non-trivial.
 		 */
 		apply_concurrent_changes(dstate, rel_dst, ident_key,
-								 ident_key_nentries, iistate);
+								 ident_key_nentries, iistate, must_complete);
+
+		if (processing_time_elapsed(must_complete))
+			/* Like above. */
+			return false;
 	}
 
 	return true;
@@ -100,8 +119,13 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 						  XLogRecPtr end_of_wal,
 						  struct timeval *must_complete)
 {
-	DecodingOutputState	*dstate;
-	ResourceOwner	resowner_old;
+	DecodingOutputState *dstate;
+	ResourceOwner resowner_old;
+#if PG_VERSION_NUM < 130000
+	/* Workaround for XLogBeginRead() in setup_decoding(). */
+	static	bool	first_time = true;
+	XLogRecPtr	startptr;
+#endif
 
 	/*
 	 * Invalidate the "present" cache before moving to "(recent) history".
@@ -129,9 +153,19 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 			char	   *errm = NULL;
 			XLogRecPtr	end_lsn;
 
+#if PG_VERSION_NUM < 130000
+			if (first_time)
+			{
+				startptr = MyReplicationSlot->data.restart_lsn;
+				first_time = false;
+			}
+			else
+				startptr = InvalidXLogRecPtr;
+#endif
+
 			record = XLogReadRecord(ctx->reader,
 #if PG_VERSION_NUM < 130000
-									InvalidXLogRecPtr,
+									startptr,
 #endif
 									&errm);
 			if (errm)
@@ -148,11 +182,7 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 			 * we no longer need the previous segment.
 			 */
 			end_lsn = ctx->reader->EndRecPtr;
-#if PG_VERSION_NUM >= 110000
 			XLByteToSeg(end_lsn, segno_new, wal_segment_size);
-#else
-			XLByteToSeg(end_lsn, segno_new);
-#endif
 			if (segno_new != squeeze_current_segment)
 			{
 				LogicalConfirmReceivedLocation(end_lsn);
@@ -161,7 +191,7 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 				squeeze_current_segment = segno_new;
 			}
 
-			CHECK_FOR_INTERRUPTS();
+			exit_if_requested();
 		}
 		InvalidateSystemCaches();
 		CurrentResourceOwner = resowner_old;
@@ -189,17 +219,15 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
  */
 static void
 apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
-						 ScanKey key, int nkeys, IndexInsertState *iistate)
+						 ScanKey key, int nkeys, IndexInsertState *iistate,
+						 struct timeval *must_complete)
 {
-	TupleTableSlot	*slot;
-#if PG_VERSION_NUM >= 120000
-	TupleTableSlot	*ind_slot;
-#endif
+	TupleTableSlot *slot;
+	TupleTableSlot *ind_slot;
 	Form_pg_index ident_form;
-	int2vector	*ident_indkey;
-	HeapTuple tup_old = NULL;
+	int2vector *ident_indkey;
+	HeapTuple	tup_old = NULL;
 	BulkInsertState bistate = NULL;
-	double	ninserts, nupdates, ndeletes;
 
 	if (dstate->nchanges == 0)
 		return;
@@ -209,17 +237,11 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	ident_indkey = &ident_form->indkey;
 
 	/* TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples(). */
-#if PG_VERSION_NUM >= 120000
 	slot = MakeSingleTupleTableSlot(dstate->tupdesc, &TTSOpsHeapTuple);
-#else
-	slot = MakeSingleTupleTableSlot(dstate->tupdesc);
-#endif
 	iistate->econtext->ecxt_scantuple = slot;
 
-#if PG_VERSION_NUM >= 120000
 	/* A slot to fetch tuples from identity index. */
 	ind_slot = table_slot_create(relation, NULL);
-#endif
 
 	/*
 	 * In case functions in the index need the active snapshot and caller
@@ -227,27 +249,23 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	 */
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	ninserts = 0;
-	nupdates = 0;
-	ndeletes = 0;
 	while (tuplestore_gettupleslot(dstate->tstore, true, false,
 								   dstate->tsslot))
 	{
-#if PG_VERSION_NUM >= 120000
-		bool	shouldFree;
-#endif
-		HeapTuple tup_change, tup, tup_exist;
-		char	*change_raw;
-		ConcurrentChange	*change;
-		bool	isnull[1];
-		Datum	values[1];
+		bool		shouldFree;
+		HeapTuple	tup_change,
+					tup,
+					tup_exist;
+		char	   *change_raw;
+		ConcurrentChange *change;
+		bool		isnull[1];
+		Datum		values[1];
+
+		Assert(dstate->nchanges > 0);
+		dstate->nchanges--;
 
 		/* Get the change from the single-column tuple. */
-#if PG_VERSION_NUM >= 120000
 		tup_change = ExecFetchSlotHeapTuple(dstate->tsslot, false, &shouldFree);
-#else
-		tup_change = ExecFetchSlotTuple(dstate->tsslot);
-#endif
 		heap_deform_tuple(tup_change, dstate->tupdesc_change, values, isnull);
 		Assert(!isnull[0]);
 
@@ -275,7 +293,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 		}
 		else if (change->kind == PG_SQUEEZE_CHANGE_INSERT)
 		{
-			List	*recheck;
+			List	   *recheck;
 
 			Assert(tup_old == NULL);
 
@@ -289,26 +307,25 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			heap_insert(relation, tup, GetCurrentCommandId(true), 0, bistate);
 
 			/* Update indexes. */
-#if PG_VERSION_NUM >= 120000
 			ExecStoreHeapTuple(tup, slot, false);
-#else
-			ExecStoreTuple(tup, slot, InvalidBuffer, false);
-#endif
 			recheck = ExecInsertIndexTuples(
 #if PG_VERSION_NUM >= 140000
 											iistate->rri,
 #endif
 											slot,
-#if PG_VERSION_NUM < 120000
-											&(tup->t_self),
-#endif
 											iistate->estate,
 #if PG_VERSION_NUM >= 140000
-											false, /* update */
+											false,	/* update */
 #endif
-											false,
-											NULL,
-											NIL);
+											false,	/* noDupErr */
+											NULL,	/* specConflict */
+											NIL /* arbiterIndexes */
+#if PG_VERSION_NUM >= 160000
+											,
+											false	/* onlySummarizing */
+#endif
+				);
+
 
 			/*
 			 * If recheck is required, it must have been preformed on the
@@ -318,15 +335,18 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			list_free(recheck);
 			pfree(tup);
 
-			ninserts++;
+			/* Update the progress information. */
+			SpinLockAcquire(&MyWorkerSlot->mutex);
+			MyWorkerSlot->progress.ins += 1;
+			SpinLockRelease(&MyWorkerSlot->mutex);
 		}
 		else if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_NEW ||
 				 change->kind == PG_SQUEEZE_CHANGE_DELETE)
 		{
 			HeapTuple	tup_key;
-			IndexScanDesc	scan;
-			int i;
-			ItemPointerData	ctid;
+			IndexScanDesc scan;
+			int			i;
+			ItemPointerData ctid;
 
 			if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_NEW)
 			{
@@ -355,9 +375,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			/* Use the incoming tuple to finalize the scan key. */
 			for (i = 0; i < scan->numberOfKeys; i++)
 			{
-				ScanKey	entry;
-				bool	isnull;
-				int16	attno_heap;
+				ScanKey		entry;
+				bool		isnull;
+				int16		attno_heap;
 
 				entry = &scan->keyData[i];
 				attno_heap = ident_indkey->values[i];
@@ -367,10 +387,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 												  &isnull);
 				Assert(!isnull);
 			}
-#if PG_VERSION_NUM >= 120000
 			if (index_getnext_slot(scan, ForwardScanDirection, ind_slot))
 			{
-				bool	shouldFreeInd;
+				bool		shouldFreeInd;
 
 				tup_exist = ExecFetchSlotHeapTuple(ind_slot, false,
 												   &shouldFreeInd);
@@ -379,9 +398,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			}
 			else
 				tup_exist = NULL;
-#else
-			tup_exist = index_getnext(scan, ForwardScanDirection);
-#endif
+
 			if (tup_exist == NULL)
 				elog(ERROR, "Failed to find target tuple");
 			ItemPointerCopy(&tup_exist->t_self, &ctid);
@@ -389,16 +406,35 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 
 			if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_NEW)
 			{
-				simple_heap_update(relation, &ctid, tup);
-				if (!HeapTupleIsHeapOnly(tup))
-				{
-					List	*recheck;
-
-#if PG_VERSION_NUM >= 120000
-					ExecStoreHeapTuple(tup, slot, false);
-#else
-					ExecStoreTuple(tup, slot, InvalidBuffer, false);
+#if PG_VERSION_NUM >= 160000
+				TU_UpdateIndexes update_indexes;
 #endif
+
+				simple_heap_update(relation, &ctid, tup
+#if PG_VERSION_NUM >= 160000
+								   ,
+								   &update_indexes
+#endif
+					);
+				/*
+				 * In PG < 16, change of any indexed attribute makes HOT
+				 * impossible, Therefore HOT update implies that no index
+				 * needs to be updated.
+				 *
+				 * In PG >= 16, if only attributes of "summarizing indexes"
+				 * change, HOT update is still possible. Therefore HOT update
+				 * might still require some indexes (in particular, the
+				 * summarizing ones) to be updated.
+				 */
+#if PG_VERSION_NUM >= 160000
+				if (update_indexes != TU_None)
+#else
+				if (!HeapTupleIsHeapOnly(tup))
+#endif
+				{
+					List	   *recheck;
+
+					ExecStoreHeapTuple(tup, slot, false);
 
 					/*
 					 * XXX Consider passing update=true, however it requires
@@ -410,25 +446,35 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 													iistate->rri,
 #endif
 													slot,
-#if PG_VERSION_NUM < 120000
-													&(tup->t_self),
-#endif
 													iistate->estate,
 #if PG_VERSION_NUM >= 140000
-													false, /* update */
+													false,	/* update */
 #endif
-													false,
-													NULL,
-													NIL);
+													false,	/* noDupErr */
+													NULL,	/* specConflict */
+													NIL /* arbiterIndexes */
+#if PG_VERSION_NUM >= 160000
+													,
+					/* onlySummarizing */
+													(update_indexes == TU_Summarizing)
+#endif
+						);
 					list_free(recheck);
 				}
 
-				nupdates++;
+				/* Update the progress information. */
+				SpinLockAcquire(&MyWorkerSlot->mutex);
+				MyWorkerSlot->progress.upd += 1;
+				SpinLockRelease(&MyWorkerSlot->mutex);
 			}
 			else
 			{
 				simple_heap_delete(relation, &ctid);
-				ndeletes++;
+
+				/* Update the progress information. */
+				SpinLockAcquire(&MyWorkerSlot->mutex);
+				MyWorkerSlot->progress.del += 1;
+				SpinLockRelease(&MyWorkerSlot->mutex);
 			}
 
 			if (tup_old != NULL)
@@ -449,19 +495,25 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			UpdateActiveSnapshotCommandId();
 		}
 
-#if PG_VERSION_NUM >= 120000
 		/* TTSOpsMinimalTuple has .get_heap_tuple==NULL. */
 		Assert(shouldFree);
 		pfree(tup_change);
-#endif
+
+		/*
+		 * If there is a limit on the time of completion, check it
+		 * now. However, make sure the loop does not break if tup_old was set
+		 * in the previous iteration. In such a case we could not resume the
+		 * processing in the next call.
+		 */
+		if (must_complete && tup_old == NULL &&
+			processing_time_elapsed(must_complete))
+			/* The next call will process the remaining changes. */
+			break;
 	}
 
-	elog(DEBUG1,
-		 "pg_squeeze: concurrent changes applied: %.0f inserts, %.0f updates, %.0f deletes.",
-		 ninserts, nupdates, ndeletes);
-
-	tuplestore_clear(dstate->tstore);
-	dstate->nchanges = 0;
+	/* If we could not apply all the changes, the next call will do. */
+	if (dstate->nchanges == 0)
+		tuplestore_clear(dstate->tstore);
 
 	PopActiveSnapshot();
 
@@ -469,15 +521,13 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	if (bistate != NULL)
 		FreeBulkInsertState(bistate);
 	ExecDropSingleTupleTableSlot(slot);
-#if PG_VERSION_NUM >= 120000
 	ExecDropSingleTupleTableSlot(ind_slot);
-#endif
 }
 
 static bool
 processing_time_elapsed(struct timeval *utmost)
 {
-	struct timeval	now;
+	struct timeval now;
 
 	if (utmost == NULL)
 		return false;
@@ -494,18 +544,18 @@ processing_time_elapsed(struct timeval *utmost)
 }
 
 IndexInsertState *
-get_index_insert_state(Relation	relation, Oid ident_index_id)
+get_index_insert_state(Relation relation, Oid ident_index_id)
 {
-	EState	*estate;
-	int	i;
-	IndexInsertState	*result;
+	EState	   *estate;
+	int			i;
+	IndexInsertState *result;
 
 	result = (IndexInsertState *) palloc0(sizeof(IndexInsertState));
 	estate = CreateExecutorState();
 	result->econtext = GetPerTupleExprContext(estate);
 
 	result->rri = (ResultRelInfo *) palloc(sizeof(ResultRelInfo));
-	InitResultRelInfo(result->rri, relation,  0, 0, 0);
+	InitResultRelInfo(result->rri, relation, 0, 0, 0);
 	ExecOpenIndices(result->rri, false);
 
 	/*
@@ -597,7 +647,7 @@ plugin_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 /* COMMIT callback */
 static void
 plugin_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
-					 XLogRecPtr commit_lsn)
+				  XLogRecPtr commit_lsn)
 {
 }
 
@@ -606,9 +656,9 @@ plugin_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
  */
 static void
 plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
-				 Relation relation, ReorderBufferChange *change)
+			  Relation relation, ReorderBufferChange *change)
 {
-	DecodingOutputState	*dstate;
+	DecodingOutputState *dstate;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 
@@ -624,7 +674,11 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				HeapTuple	newtuple;
 
 				newtuple = change->data.tp.newtuple != NULL ?
+#if PG_VERSION_NUM >= 170000
+					change->data.tp.newtuple : NULL;
+#else
 					&change->data.tp.newtuple->tuple : NULL;
+#endif
 
 				/*
 				 * Identity checks in the main function should have made this
@@ -638,12 +692,21 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			break;
 		case REORDER_BUFFER_CHANGE_UPDATE:
 			{
-				HeapTuple oldtuple, newtuple;
+				HeapTuple	oldtuple,
+							newtuple;
 
 				oldtuple = change->data.tp.oldtuple != NULL ?
+#if PG_VERSION_NUM >= 170000
+					change->data.tp.oldtuple : NULL;
+#else
 					&change->data.tp.oldtuple->tuple : NULL;
+#endif
 				newtuple = change->data.tp.newtuple != NULL ?
+#if PG_VERSION_NUM >= 170000
+					change->data.tp.newtuple : NULL;
+#else
 					&change->data.tp.newtuple->tuple : NULL;
+#endif
 
 				if (newtuple == NULL)
 					elog(ERROR, "Incomplete update info.");
@@ -656,10 +719,14 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
 			{
-				HeapTuple oldtuple;
+				HeapTuple	oldtuple;
 
 				oldtuple = change->data.tp.oldtuple ?
+#if PG_VERSION_NUM >= 170000
+					change->data.tp.oldtuple : NULL;
+#else
 					&change->data.tp.oldtuple->tuple : NULL;
+#endif
 
 				if (oldtuple == NULL)
 					elog(ERROR, "Incomplete delete info.");
@@ -679,15 +746,15 @@ static void
 store_change(LogicalDecodingContext *ctx, ConcurrentChangeKind kind,
 			 HeapTuple tuple)
 {
-	DecodingOutputState	*dstate;
-	char	*change_raw;
-	ConcurrentChange	*change;
-	MemoryContext	oldcontext;
-	bool	flattened = false;
-	Size	size;
-	Datum	values[1];
-	bool	isnull[1];
-	char	*dst;
+	DecodingOutputState *dstate;
+	char	   *change_raw;
+	ConcurrentChange *change;
+	MemoryContext oldcontext;
+	bool		flattened = false;
+	Size		size;
+	Datum		values[1];
+	bool		isnull[1];
+	char	   *dst;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 
@@ -755,9 +822,9 @@ store_change(LogicalDecodingContext *ctx, ConcurrentChangeKind kind,
 static HeapTuple
 get_changed_tuple(ConcurrentChange *change)
 {
-	HeapTupleData	tup_data;
+	HeapTupleData tup_data;
 	HeapTuple	result;
-	char	*src;
+	char	   *src;
 
 	/*
 	 * Ensure alignment before accessing the fields. (This is why we can't use
@@ -780,7 +847,7 @@ get_changed_tuple(ConcurrentChange *change)
 static bool
 plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id)
 {
-	DecodingOutputState	*dstate;
+	DecodingOutputState *dstate;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 
